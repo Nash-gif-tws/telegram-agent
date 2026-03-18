@@ -3,6 +3,8 @@ import { Telegraf } from "telegraf"
 import { message } from "telegraf/filters"
 import { chat, clearHistory, getHistoryLength } from "./claude"
 import { initReminders } from "./reminders"
+import { pendingApprovals } from "./tools"
+import fs from "fs"
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!)
 
@@ -69,9 +71,29 @@ bot.on(message("text"), async (ctx) => {
     const response = await chat(userId, userMessage)
     clearInterval(typingInterval)
 
+    // Check if Claude generated documents — send them as PDFs
+    const docMatches = [...response.matchAll(/(INVOICE|CONTRACT)_GENERATED:([^:]+):(.+?)(?=\n|$)/g)]
+    for (const match of docMatches) {
+      const [, docType, approvalId, filepath] = match
+      const pending = pendingApprovals.get(approvalId)
+      if (pending && fs.existsSync(filepath)) {
+        await ctx.replyWithDocument(
+          { source: filepath, filename: filepath.split(/[\\/]/).pop()! },
+          { caption: `📄 ${docType === "INVOICE" ? "Invoice" : "Contract"} for ${pending.customerName}\n\nReply with "send ${approvalId}" to email this to ${pending.customerEmail}, or "discard ${approvalId}" to cancel.` }
+        )
+      }
+    }
+
+    // Strip internal tokens from the text response
+    const cleanResponse = response
+      .replace(/(INVOICE|CONTRACT)_GENERATED:[^\n]+/g, "")
+      .trim()
+
+    if (!cleanResponse) return
+
     // Telegram has 4096 char limit — split if needed
-    if (response.length <= 4096) {
-      await ctx.reply(response, { parse_mode: "Markdown" })
+    if (cleanResponse.length <= 4096) {
+      await ctx.reply(cleanResponse, { parse_mode: "Markdown" })
     } else {
       // Split on double newlines
       const chunks: string[] = []
@@ -88,6 +110,17 @@ bot.on(message("text"), async (ctx) => {
       for (const chunk of chunks) {
         await ctx.reply(chunk, { parse_mode: "Markdown" })
       }
+    }
+
+    // Handle quick "send <id>" / "discard <id>" shortcuts
+    const sendMatch = userMessage.match(/^send\s+((?:inv|con)-\d+)/i)
+    const discardMatch = userMessage.match(/^discard\s+((?:inv|con)-\d+)/i)
+    if (sendMatch) {
+      const result = await chat(userId, `Use the send_documents tool with approval_id "${sendMatch[1]}"`)
+      await ctx.reply(result, { parse_mode: "Markdown" })
+    } else if (discardMatch) {
+      pendingApprovals.delete(discardMatch[1])
+      await ctx.reply(`Discarded. Document not sent.`)
     }
   } catch (err) {
     console.error("Error:", err)

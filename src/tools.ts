@@ -1,5 +1,19 @@
 import { saveWorkflow, listWorkflows, getWorkflow, deleteWorkflow } from "./workflows"
 import { setReminder } from "./reminders"
+import { fetchAllEmails, sendEmail, getPrimaryAccount, getAccountByEmail, loadEmailAccounts } from "./email"
+import { generateInvoice, generateContract, InvoiceData, ContractData } from "./invoice"
+import path from "path"
+
+// Pending documents waiting for user approval: key = approvalId
+export const pendingApprovals = new Map<string, {
+  type: "invoice" | "contract" | "both"
+  files: string[]
+  customerEmail: string
+  customerName: string
+  subject: string
+  body: string
+  fromEmail?: string
+}>()
 
 // ─── Tool Definitions ──────────────────────────────────────────────────────────
 
@@ -48,6 +62,77 @@ export const toolDefinitions = [
         id: { type: "string", description: "The workflow id to delete" },
       },
       required: ["id"],
+    },
+  },
+
+  // Email tools
+  {
+    name: "fetch_emails",
+    description: "Fetch recent unread emails from all configured email accounts. Returns emails sorted by date, newest first.",
+    input_schema: {
+      type: "object",
+      properties: {
+        max_per_account: { type: "number", description: "Max emails to fetch per account (default 20)" },
+      },
+    },
+  },
+  {
+    name: "generate_invoice",
+    description: "Generate a PDF invoice from quote/project details. Use when user wants to turn a quote into an invoice.",
+    input_schema: {
+      type: "object",
+      properties: {
+        customer_name: { type: "string" },
+        customer_email: { type: "string" },
+        customer_address: { type: "string" },
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              description: { type: "string" },
+              quantity: { type: "number" },
+              unit_price: { type: "number" },
+            },
+            required: ["description", "quantity", "unit_price"],
+          },
+        },
+        notes: { type: "string" },
+        payment_terms: { type: "string" },
+        from_email: { type: "string", description: "Which of your email addresses to send from (optional)" },
+      },
+      required: ["customer_name", "customer_email", "items"],
+    },
+  },
+  {
+    name: "generate_contract",
+    description: "Generate a PDF service contract/agreement from project details.",
+    input_schema: {
+      type: "object",
+      properties: {
+        customer_name: { type: "string" },
+        customer_email: { type: "string" },
+        project_description: { type: "string" },
+        deliverables: { type: "array", items: { type: "string" } },
+        total_amount: { type: "number" },
+        payment_schedule: { type: "string" },
+        start_date: { type: "string" },
+        completion_date: { type: "string" },
+        special_terms: { type: "string" },
+        from_email: { type: "string" },
+      },
+      required: ["customer_name", "customer_email", "project_description", "deliverables", "total_amount", "payment_schedule"],
+    },
+  },
+  {
+    name: "send_documents",
+    description: "Send generated invoice/contract documents to the customer via email after user approves. Use the approval_id returned by generate_invoice or generate_contract.",
+    input_schema: {
+      type: "object",
+      properties: {
+        approval_id: { type: "string", description: "The approval ID returned when documents were generated" },
+      },
+      required: ["approval_id"],
     },
   },
 
@@ -133,6 +218,105 @@ export async function executeTool(
 
       case "set_reminder":
         return setReminder(input.message as string, input.delay_minutes as number)
+
+      case "fetch_emails": {
+        const emails = await fetchAllEmails((input.max_per_account as number) ?? 20)
+        if (!emails.length) return "No unread emails found across configured accounts."
+        return emails.map(e =>
+          `[${e.account}] ${e.date.slice(0, 10)} | From: ${e.from} | Subject: ${e.subject}\n${e.body.slice(0, 300)}`
+        ).join("\n\n---\n\n")
+      }
+
+      case "generate_invoice": {
+        const biz = {
+          businessName: process.env.BUSINESS_NAME ?? "Snowskiers Warehouse",
+          businessABN: process.env.BUSINESS_ABN ?? "",
+          businessAddress: process.env.BUSINESS_ADDRESS ?? "",
+          businessEmail: process.env.BUSINESS_EMAIL ?? "",
+          businessPhone: process.env.BUSINESS_PHONE ?? "",
+        }
+        const items = (input.items as Array<{ description: string; quantity: number; unit_price: number }>)
+          .map(i => ({ description: i.description, quantity: i.quantity, unitPrice: i.unit_price }))
+        const invoiceNum = `INV-${Date.now().toString().slice(-6)}`
+        const today = new Date()
+        const due = new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000)
+        const data: InvoiceData = {
+          invoiceNumber: invoiceNum,
+          date: today.toLocaleDateString("en-AU"),
+          dueDate: due.toLocaleDateString("en-AU"),
+          ...biz,
+          customerName: input.customer_name as string,
+          customerEmail: input.customer_email as string,
+          customerAddress: input.customer_address as string | undefined,
+          items,
+          notes: input.notes as string | undefined,
+          paymentTerms: (input.payment_terms as string) ?? "Payment due within 14 days of invoice date. Bank transfer preferred.",
+        }
+        const filepath = await generateInvoice(data)
+        const approvalId = `inv-${Date.now()}`
+        pendingApprovals.set(approvalId, {
+          type: "invoice",
+          files: [filepath],
+          customerEmail: input.customer_email as string,
+          customerName: input.customer_name as string,
+          subject: `Invoice ${invoiceNum} from ${biz.businessName}`,
+          body: `Please find attached Invoice ${invoiceNum}.\n\nThank you for your business.\n\n${biz.businessName}`,
+          fromEmail: input.from_email as string | undefined,
+        })
+        return `INVOICE_GENERATED:${approvalId}:${filepath}`
+      }
+
+      case "generate_contract": {
+        const biz = {
+          businessName: process.env.BUSINESS_NAME ?? "Snowskiers Warehouse",
+          businessABN: process.env.BUSINESS_ABN ?? "",
+        }
+        const contractNum = `CON-${Date.now().toString().slice(-6)}`
+        const data: ContractData = {
+          contractNumber: contractNum,
+          date: new Date().toLocaleDateString("en-AU"),
+          ...biz,
+          customerName: input.customer_name as string,
+          customerEmail: input.customer_email as string,
+          projectDescription: input.project_description as string,
+          deliverables: input.deliverables as string[],
+          totalAmount: input.total_amount as number,
+          paymentSchedule: input.payment_schedule as string,
+          startDate: input.start_date as string | undefined,
+          completionDate: input.completion_date as string | undefined,
+          specialTerms: input.special_terms as string | undefined,
+        }
+        const filepath = await generateContract(data)
+        const approvalId = `con-${Date.now()}`
+        pendingApprovals.set(approvalId, {
+          type: "contract",
+          files: [filepath],
+          customerEmail: input.customer_email as string,
+          customerName: input.customer_name as string,
+          subject: `Service Agreement ${contractNum} from ${biz.businessName}`,
+          body: `Please find attached your Service Agreement.\n\nPlease review, sign, and return a copy at your earliest convenience.\n\n${biz.businessName}`,
+          fromEmail: input.from_email as string | undefined,
+        })
+        return `CONTRACT_GENERATED:${approvalId}:${filepath}`
+      }
+
+      case "send_documents": {
+        const approvalId = input.approval_id as string
+        const pending = pendingApprovals.get(approvalId)
+        if (!pending) return `No pending document found with id "${approvalId}". It may have already been sent.`
+        const accounts = loadEmailAccounts()
+        const fromAccount = (pending.fromEmail ? getAccountByEmail(pending.fromEmail) : null) ?? getPrimaryAccount()
+        if (!fromAccount) return "Error: No email account configured. Add EMAIL_ACCOUNTS env var."
+        await sendEmail(
+          fromAccount,
+          pending.customerEmail,
+          pending.subject,
+          pending.body,
+          pending.files.map(f => ({ filename: path.basename(f), path: f }))
+        )
+        pendingApprovals.delete(approvalId)
+        return `Documents sent to ${pending.customerName} (${pending.customerEmail}) from ${fromAccount.email}.`
+      }
 
       default:
         return `Unknown tool: ${name}`
