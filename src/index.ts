@@ -2,6 +2,7 @@ import "dotenv/config"
 import { Telegraf } from "telegraf"
 import { message } from "telegraf/filters"
 import { chat, clearHistory, getHistoryLength } from "./claude"
+import { initReminders } from "./reminders"
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!)
 
@@ -19,9 +20,16 @@ function isAllowed(userId: number): boolean {
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 bot.command("start", (ctx) => {
+  const userId = ctx.from.id
+  if (ALLOWED_USER_IDS.length > 0) initReminders(bot, userId)
   ctx.reply(
-    `Hey! I'm your personal Claude agent.\n\nI can:\n• Search the web\n• Check your rental system & Shopify\n• Run server commands\n• Help with anything\n\n/clear — reset conversation\n/status — show conversation info`
+    `Hey! I'm your personal Claude agent.\n\nI can:\n• Search the web & fetch pages\n• Save and run named workflows\n• Call any external API\n• Set reminders\n\n/workflows — list saved workflows\n/clear — reset conversation\n/status — show info`
   )
+})
+
+bot.command("workflows", async (ctx) => {
+  const response = await chat(ctx.from.id, "list my saved workflows")
+  ctx.reply(response, { parse_mode: "Markdown" })
 })
 
 bot.command("clear", (ctx) => {
@@ -38,6 +46,9 @@ bot.command("status", (ctx) => {
 
 bot.on(message("text"), async (ctx) => {
   const userId = ctx.from.id
+
+  // Init reminders so the bot can message this user back
+  initReminders(bot, userId)
 
   if (!isAllowed(userId)) {
     ctx.reply("Sorry, this bot is private.")

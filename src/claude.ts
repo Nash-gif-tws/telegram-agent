@@ -1,14 +1,20 @@
 import Anthropic from "@anthropic-ai/sdk"
-import { toolDefinitions } from "./tools"
+import { toolDefinitions, executeTool } from "./tools"
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const conversations = new Map<number, Anthropic.MessageParam[]>()
 const MAX_HISTORY = 20
 
-const SYSTEM_PROMPT = `You are a helpful personal AI assistant. You have access to web search and web browsing to find current information.
+const SYSTEM_PROMPT = `You are a helpful personal AI assistant with tools to search the web, call APIs, manage workflows, and set reminders.
 
-Be concise and direct. Use markdown formatting when it helps readability. If a task needs web search, just do it without asking.`
+**Workflows:** You can save, list, and run named workflows. When the user asks to "run X" or "do X", check if a workflow exists for it using get_workflow, then execute its steps. When saving a workflow, write detailed steps so you can execute them autonomously later.
+
+**HTTP requests:** Use http_request to call any external API — Shopify, Railway, Slack, email services, webhooks, etc.
+
+**Reminders:** Use set_reminder for one-time future messages.
+
+Be concise and action-oriented. Execute tasks directly without asking for confirmation unless something is genuinely ambiguous. Use markdown formatting when it helps.`
 
 export async function chat(userId: number, message: string): Promise<string> {
   if (!conversations.has(userId)) conversations.set(userId, [])
@@ -39,14 +45,19 @@ export async function chat(userId: number, message: string): Promise<string> {
     }
 
     if (response.stop_reason === "tool_use") {
-      // Server-side tools run automatically — just feed back empty results
-      const toolResults = response.content
-        .filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use")
-        .map((b) => ({
-          type: "tool_result" as const,
-          tool_use_id: b.id,
-          content: "",
-        }))
+      const toolUseBlocks = response.content.filter(
+        (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
+      )
+      const toolResults: Anthropic.ToolResultBlockParam[] = []
+      for (const block of toolUseBlocks) {
+        // Server-side tools (web_search, web_fetch) run automatically — empty result
+        // Custom tools need to be executed here
+        const isServerSide = ["web_search", "web_fetch"].includes(block.name)
+        const result = isServerSide
+          ? ""
+          : await executeTool(block.name, block.input as Record<string, unknown>)
+        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result })
+      }
       history.push({ role: "user", content: toolResults })
     }
   }
